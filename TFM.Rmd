@@ -1,0 +1,2031 @@
+---
+title: "Construcción y validación de modelos predictivos de moléculas activas para el cáncer de mama"
+author: "Mónica Cepeda Sotomayor"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  html_document:
+params:
+  moleculas_chembl: "ChEMBL_BCRP.csv"
+  moleculas_descriptores: "moleculas_descriptores.csv"
+  cor: 0.8 # Correlación
+  standard_value: 2.5 # concentración IC50 en micromolar
+  set_seed_random: 12345 # semilla aleatoria para separar train y test
+  set_seed_models: 123 # Semilla aleatoria aplicada a los modelos requeridos
+  prop_train: 0.7 # Proporción de datos para el dataset train
+  k: 21 # Valor de k, algoritmo k-Nearest Neighbour 
+  k_imp: 9 # Valor de k segundo modelo, algoritmo k-Nearest Neighbour 
+  laplace: 0 # Valor de laplace, algoritmo Naive Bayes
+  laplace_imp: 10 # Valor de laplace segundo modelo, algoritmo Naive Bayes
+  hidden: !r c(5) # Arquitectura ANN, algoritmo Artificial Neuronal Network
+  hidden_imp: !r c(6,4) # Arquitectura ANN segundo modelo, algoritmo Artificial Neuronal Network
+  kernel: vanilladot # Tipo de kernel, algoritmo Support Vector Machine 
+  kernel_imp: rbfdot # Tipo de kernel segundo modelo, algoritmo Support Vector Machine 
+  trials: 5 # Valor de trials, algoritmo Árbol de Decisión
+  trials_imp: 10 # Valor de trials segundo modelo, algoritmo Árbol de Decisión
+  mtry: 4 # Valor de mtry, algoritmo Random Forest
+  mtry_imp: 8 # Valor de mtry segundo modelo, algoritmo Random Forest
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+if (!(require(dplyr))) install.packages("dplyr")
+if (!(require(knitr))) install.packages("knitr")
+if (!(require(caret))) install.packages("caret")
+if (!(require(class))) install.packages("class")
+if (!(require(e1071))) install.packages("e1071")
+if (!(require(neuralnet))) install.packages("neuralnet")
+if (!(require(kernlab))) install.packages("kernlab")
+if (!(require(C50))) install.packages("C50")
+if (!(require(randomForest))) install.packages("randomForest")
+if (!(require(ROCR))) install.packages("ROCR")
+```
+
+
+
+# Leer fichero BD y Filtrar
+
+Se lee el archivo csv descargado de ChEMBL y se eliminan moléculas con valores faltantes o repetidas. El dataset resultado se escribe en un csv para ser utilizado en KNIME.
+
+```{r}
+moleculas <- read.csv(params$moleculas_chembl, sep = ";", stringsAsFactors = FALSE, na.strings = "")
+
+
+moleculas <- moleculas[ ,c(1,8:12)]
+
+
+moleculas$Standard.Type <- as.factor(moleculas$Standard.Type)
+moleculas$Standard.Relation <- as.factor(moleculas$Standard.Relation)
+moleculas$Standard.Units <- as.factor(moleculas$Standard.Units)
+
+summary(moleculas)
+
+
+any(is.na(moleculas$Molecule.ChEMBL.ID))
+any(is.na(moleculas$Smiles))
+
+
+moleculas <- moleculas[moleculas$Standard.Relation == "'='", ]
+moleculas <- na.omit(moleculas)
+
+
+moleculas <- moleculas %>% arrange(Standard.Value) %>% distinct(Smiles, .keep_all = TRUE)
+moleculas <- moleculas[ ,c(1,2,5)]
+moleculas$Standard.Value <- round(moleculas$Standard.Value/1000, 4)
+```
+
+```{r}
+write.csv(moleculas, "moleculas_filtrado.csv", row.names = FALSE)
+```
+
+
+
+# Preparar datos
+
+Después de obtener los descriptores en KNIME, leemos los datos y los preparamos para el machine learning.
+
+```{r}
+moleculas_ML <- read.csv(params$moleculas_descriptores, sep = ";", stringsAsFactors = FALSE, na.strings = "")
+```
+
+
+Eliminamos descriptores que tienen poca varianza o una correlación mayor a `r params$cor`.
+
+```{r}
+nearvar <- nearZeroVar(moleculas_ML[4:ncol(moleculas_ML)], names = TRUE)
+moleculas_ML <- moleculas_ML[!names(moleculas_ML) %in% nearvar]
+```
+
+```{r}
+cor_mat <- cor(moleculas_ML[4:ncol(moleculas_ML)])
+cor_index <- findCorrelation(cor_mat, params$cor)
+cor_removed <- colnames(cor_mat)[cor_index]
+moleculas_ML <- moleculas_ML[!names(moleculas_ML) %in% cor_removed]
+```
+
+
+Explorar los datos
+
+```{r}
+str(moleculas_ML)
+```
+
+```{r}
+summary(moleculas_ML)
+```
+
+Histogramas de los descriptores
+
+```{r}
+layout(matrix(c(1:6), ncol=3))
+for (col in 4:(ncol(moleculas_ML))){
+  hist(moleculas_ML[,col], breaks = 20, main = names(moleculas_ML[col]), xlab = names(moleculas_ML[col]), col= "#FFB900")
+}
+```
+
+
+Añadimos la variable actividad
+
+
+```{r}
+moleculas_ML$Actividad <- as.factor(ifelse(moleculas_ML$Standard.Value <= params$standard_value, "S", "N"))
+```
+
+```{r}
+summary(moleculas_ML$Actividad)
+```
+
+
+Realizamos las normalizaciones
+
+
+```{r}
+normalize <- function(x){
+  return((x - min(x)) / (max(x) - min(x)))
+}
+```
+
+```{r}
+moleculas_ML_n <- as.data.frame(lapply(moleculas_ML[4:(ncol(moleculas_ML)-1)], normalize))
+moleculas_ML_z_scale <- scale(moleculas_ML[4:(ncol(moleculas_ML)-1)])
+moleculas_ML_z <- as.data.frame(moleculas_ML_z_scale)
+```
+
+
+Creamos los datasets train y test
+
+```{r}
+set.seed(params$set_seed_random)
+random <- sample(nrow(moleculas_ML), round(nrow(moleculas_ML)*params$prop_train,0))
+
+train <- moleculas_ML[random, ]
+test <- moleculas_ML[-random, ]
+train <- train[ ,4:ncol(train)]
+test <- test[ ,4:ncol(test)]
+
+train_sin <- train[ ,-ncol(train)]
+test_sin <- test[ ,-ncol(test)]
+
+train_n <- moleculas_ML_n[random, ]
+test_n <- moleculas_ML_n[-random, ]
+
+train_z <- moleculas_ML_z[random, ]
+test_z <- moleculas_ML_z[-random, ]
+
+Actividad <- train$Actividad
+train_n_ftr <- as.data.frame(cbind(train_n, Actividad))
+train_z_ftr <- as.data.frame(cbind(train_z, Actividad))
+```
+
+
+```{r}
+summary(train$Actividad)
+summary(test$Actividad)
+```
+
+
+
+## K-vecinos más próximos
+
+
+Modelo datos sin normalizar y k = `r params$k`
+
+```{r}
+knn_pred <- knn(train = train_sin, test = test_sin, cl = train$Actividad, k = params$k, prob = TRUE)
+
+knn_eval <- confusionMatrix(knn_pred, test$Actividad, positive="S")
+knn_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob <- c()
+for (i in 1:length(knn_pred)){
+  if (knn_pred[i] == "S")
+    knn_prob[i] <- attributes(knn_pred)$prob[i]
+  else 
+    knn_prob[i] <- 1-attributes(knn_pred)$prob[i]
+}
+
+knn_pred_roc <- prediction(predictions = knn_prob, labels = test$Actividad)
+knn_perf <- performance(knn_pred_roc, measure = "tpr", x.measure = "fpr")
+knn_perf.auc <- performance(knn_pred_roc, measure = "auc")
+knn_auc <- round(unlist(knn_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y k = `r params$k_imp`
+
+```{r}
+knn_pred_imp <- knn(train = train_sin, test = test_sin, cl = train$Actividad, k = params$k_imp, prob = TRUE)
+
+knn_eval_imp <- confusionMatrix(knn_pred_imp, test$Actividad, positive="S")
+knn_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob_imp <- c()
+for (i in 1:length(knn_pred_imp)){
+  if (knn_pred_imp[i] == "S")
+    knn_prob_imp[i] <- attributes(knn_pred_imp)$prob[i]
+  else 
+    knn_prob_imp[i] <- 1-attributes(knn_pred_imp)$prob[i]
+}
+
+knn_pred_roc_imp <- prediction(predictions = knn_prob_imp, labels = test$Actividad)
+knn_perf_imp <- performance(knn_pred_roc_imp, measure = "tpr", x.measure = "fpr")
+knn_perf.auc_imp <- performance(knn_pred_roc_imp, measure = "auc")
+knn_auc_imp <- round(unlist(knn_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y k = `r params$k`
+
+```{r}
+knn_pred_n <- knn(train = train_n, test = test_n, cl = train$Actividad, k = params$k, prob = TRUE)
+
+knn_eval_n <- confusionMatrix(knn_pred_n, test$Actividad, positive="S")
+knn_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob_n <- c()
+for (i in 1:length(knn_pred_n)){
+  if (knn_pred_n[i] == "S")
+    knn_prob_n[i] <- attributes(knn_pred_n)$prob[i]
+  else 
+    knn_prob_n[i] <- 1-attributes(knn_pred_n)$prob[i]
+}
+
+knn_pred_roc_n <- prediction(predictions = knn_prob_n, labels = test$Actividad)
+knn_perf_n <- performance(knn_pred_roc_n, measure = "tpr", x.measure = "fpr")
+knn_perf.auc_n <- performance(knn_pred_roc_n, measure = "auc")
+knn_auc_n <- round(unlist(knn_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y k = `r params$k_imp`
+
+```{r}
+knn_pred_imp_n <- knn(train = train_n, test = test_n, cl = train$Actividad, k = params$k_imp, prob = TRUE)
+
+knn_eval_imp_n <- confusionMatrix(knn_pred_imp_n, test$Actividad, positive="S")
+knn_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob_imp_n <- c()
+for (i in 1:length(knn_pred_imp_n)){
+  if (knn_pred_imp_n[i] == "S")
+    knn_prob_imp_n[i] <- attributes(knn_pred_imp_n)$prob[i]
+  else 
+    knn_prob_imp_n[i] <- 1-attributes(knn_pred_imp_n)$prob[i]
+}
+
+knn_pred_roc_imp_n <- prediction(predictions = knn_prob_imp_n, labels = test$Actividad)
+knn_perf_imp_n <- performance(knn_pred_roc_imp_n, measure = "tpr", x.measure = "fpr")
+knn_perf.auc_imp_n <- performance(knn_pred_roc_imp_n, measure = "auc")
+knn_auc_imp_n <- round(unlist(knn_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y k = `r params$k`
+
+```{r}
+knn_pred_z <- knn(train = train_z, test = test_z, cl = train$Actividad, k = params$k, prob = TRUE)
+
+knn_eval_z <- confusionMatrix(knn_pred_z, test$Actividad, positive="S")
+knn_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob_z <- c()
+for (i in 1:length(knn_pred_z)){
+  if (knn_pred_z[i] == "S")
+    knn_prob_z[i] <- attributes(knn_pred_z)$prob[i]
+  else 
+    knn_prob_z[i] <- 1-attributes(knn_pred_z)$prob[i]
+}
+
+knn_pred_roc_z <- prediction(predictions = knn_prob_z, labels = test$Actividad)
+knn_perf_z <- performance(knn_pred_roc_z, measure = "tpr", x.measure = "fpr")
+knn_perf.auc_z <- performance(knn_pred_roc_z, measure = "auc")
+knn_auc_z <- round(unlist(knn_perf.auc_z@y.values), 3)
+```
+
+
+Datos normalización z y k = `r params$k_imp`
+
+```{r}
+knn_pred_imp_z <- knn(train = train_z, test = test_z, cl = train$Actividad, k = params$k_imp, prob = TRUE)
+
+knn_eval_imp_z <- confusionMatrix(knn_pred_imp_z, test$Actividad, positive="S")
+knn_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+knn_prob_imp_z <- c()
+for (i in 1:length(knn_pred_imp_z)){
+  if (knn_pred_imp_z[i] == "S")
+    knn_prob_imp_z[i] <- attributes(knn_pred_imp_z)$prob[i]
+  else 
+    knn_prob_imp_z[i] <- 1-attributes(knn_pred_imp_z)$prob[i]
+}
+
+knn_pred_roc_imp_z <- prediction(predictions = knn_prob_imp_z, labels = test$Actividad)
+knn_perf_imp_z <- performance(knn_pred_roc_imp_z, measure = "tpr", x.measure = "fpr")
+knn_perf.auc_imp_z <- performance(knn_pred_roc_imp_z, measure = "auc")
+knn_auc_imp_z <- round(unlist(knn_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla resultados
+
+```{r}
+numeracion <- c(1:6)
+
+knn_Modelo <- rep("kNN", 6)
+
+knn_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+knn_Parametro <- rep(c(paste("k = ", params$k), paste("k = ", params$k_imp)), 3)
+
+knn_TP <- c(knn_eval[["table"]][4],
+            knn_eval_imp[["table"]][4],
+            knn_eval_n[["table"]][4],
+            knn_eval_imp_n[["table"]][4],
+            knn_eval_z[["table"]][4],
+            knn_eval_imp_z[["table"]][4])
+
+knn_TN <- c(knn_eval[["table"]][1],
+            knn_eval_imp[["table"]][1],
+            knn_eval_n[["table"]][1],
+            knn_eval_imp_n[["table"]][1],
+            knn_eval_z[["table"]][1],
+            knn_eval_imp_z[["table"]][1])
+
+knn_FP <- c(knn_eval[["table"]][2],
+            knn_eval_imp[["table"]][2],
+            knn_eval_n[["table"]][2],
+            knn_eval_imp_n[["table"]][2],
+            knn_eval_z[["table"]][2],
+            knn_eval_imp_z[["table"]][2])
+
+knn_FN <- c(knn_eval[["table"]][3],
+            knn_eval_imp[["table"]][3],
+            knn_eval_n[["table"]][3],
+            knn_eval_imp_n[["table"]][3],
+            knn_eval_z[["table"]][3],
+            knn_eval_imp_z[["table"]][3])
+
+knn_Sensibilidad <- c(round(knn_eval[["byClass"]][1], 4),
+                      round(knn_eval_imp[["byClass"]][1], 4),
+                      round(knn_eval_n[["byClass"]][1], 4),
+                      round(knn_eval_imp_n[["byClass"]][1], 4),
+                      round(knn_eval_z[["byClass"]][1], 4),
+                      round(knn_eval_imp_z[["byClass"]][1], 4))
+
+knn_Especificidad <- c(round(knn_eval[["byClass"]][2], 4),
+                      round(knn_eval_imp[["byClass"]][2], 4),
+                      round(knn_eval_n[["byClass"]][2], 4),
+                      round(knn_eval_imp_n[["byClass"]][2], 4),
+                      round(knn_eval_z[["byClass"]][2], 4),
+                      round(knn_eval_imp_z[["byClass"]][2], 4))
+
+knn_Accuracy <- c(round(knn_eval[["overall"]][1], 4),
+                  round(knn_eval_imp[["overall"]][1], 4),
+                  round(knn_eval_n[["overall"]][1], 4),
+                  round(knn_eval_imp_n[["overall"]][1], 4),
+                  round(knn_eval_z[["overall"]][1], 4),
+                  round(knn_eval_imp_z[["overall"]][1], 4))
+
+knn_Kappa <- c(round(knn_eval[["overall"]][2], 4),
+                  round(knn_eval_imp[["overall"]][2], 4),
+                  round(knn_eval_n[["overall"]][2], 4),
+                  round(knn_eval_imp_n[["overall"]][2], 4),
+                  round(knn_eval_z[["overall"]][2], 4),
+                  round(knn_eval_imp_z[["overall"]][2], 4))
+
+knn_AUC <- c(round(knn_auc, 4),
+             round(knn_auc_imp, 4),
+             round(knn_auc_n, 4),
+             round(knn_auc_imp_n, 4),
+             round(knn_auc_z, 4),
+             round(knn_auc_imp_z, 4))
+
+
+knn_tabla <- data.frame(numeracion, knn_Modelo, knn_Normalizacion, knn_Parametro, knn_TP, knn_TN, knn_FP, knn_FN, knn_Sensibilidad, knn_Especificidad, knn_Accuracy, knn_Kappa, knn_AUC)
+colnames_tabla <- c("", "Algoritmo", "Normalización", "Parámetro", "TP", "TN", "FP", "FN", "Sensibilidad", "Especificidad", "Accuracy", "Kappa", "AUC")
+```
+
+```{r message=FALSE}
+knitr::kable(knn_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(knn_perf, main = paste("ROC curve kNN k =", params$k), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc), cex = 1.25)
+
+plot(knn_perf_imp, main = paste("ROC curve kNN k =", params$k_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc_imp), cex = 1.25)
+
+plot(knn_perf_n, main = paste("ROC curve kNN (n) k =", params$k), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc_n), cex = 1.25)
+
+plot(knn_perf_imp_n, main = paste("ROC curve kNN (n) k =", params$k_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc_imp_n), cex = 1.25)
+
+plot(knn_perf_z, main = paste("ROC curve kNN (z) k =", params$k), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc_z), cex = 1.25)
+
+plot(knn_perf_imp_z, main = paste("ROC curve kNN (z) k =", params$k_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", knn_auc_imp_z), cex = 1.25)
+```
+
+
+
+## Naive Bayes
+
+
+Modelo datos sin normalizar y laplace = `r params$laplace`
+
+```{r}
+nbayes_model <- naiveBayes(train_sin, train$Actividad, laplace = params$laplace)
+
+nbayes_pred <- predict(nbayes_model, test_sin)
+
+nbayes_eval <- confusionMatrix(nbayes_pred, test$Actividad, positive = "S")
+nbayes_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob <- as.data.frame(predict(nbayes_model, test_sin, type = "raw"))
+nbayes_prob.pos <- nbayes_prob$S
+
+nbayes_roc <- prediction(predictions = nbayes_prob.pos, labels = test$Actividad)
+nbayes_perf <- performance(nbayes_roc, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc <- performance(nbayes_roc, measure = "auc")
+nbayes_auc <- round(unlist(nbayes_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y laplace = `r params$laplace_imp`
+
+```{r}
+nbayes_model_imp <- naiveBayes(train_sin, train$Actividad, laplace = params$laplace_imp)
+
+nbayes_pred_imp <- predict(nbayes_model_imp, test_sin)
+
+nbayes_eval_imp <- confusionMatrix(nbayes_pred_imp, test$Actividad, positive = "S")
+nbayes_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob_imp <- as.data.frame(predict(nbayes_model_imp, test_sin, type = "raw"))
+nbayes_prob.pos_imp <- nbayes_prob_imp$S
+
+nbayes_roc_imp <- prediction(predictions = nbayes_prob.pos_imp, labels = test$Actividad)
+nbayes_perf_imp <- performance(nbayes_roc_imp, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc_imp <- performance(nbayes_roc_imp, measure = "auc")
+nbayes_auc_imp <- round(unlist(nbayes_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y laplace = `r params$laplace`
+
+```{r}
+nbayes_model_n <- naiveBayes(train_n, train$Actividad, laplace = params$laplace)
+
+nbayes_pred_n <- predict(nbayes_model_n, test_n)
+
+nbayes_eval_n <- confusionMatrix(nbayes_pred_n, test$Actividad, positive = "S")
+nbayes_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob_n <- as.data.frame(predict(nbayes_model_n, test_n, type = "raw"))
+nbayes_prob.pos_n <- nbayes_prob_n$S
+
+nbayes_roc_n <- prediction(predictions = nbayes_prob.pos_n, labels = test$Actividad)
+nbayes_perf_n <- performance(nbayes_roc_n, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc_n <- performance(nbayes_roc_n, measure = "auc")
+nbayes_auc_n <- round(unlist(nbayes_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y laplace = `r params$laplace_imp`
+
+```{r}
+nbayes_model_imp_n <- naiveBayes(train_n, train$Actividad, laplace = params$laplace_imp)
+
+nbayes_pred_imp_n <- predict(nbayes_model_imp_n, test_n)
+
+nbayes_eval_imp_n <- confusionMatrix(nbayes_pred_imp_n, test$Actividad, positive = "S")
+nbayes_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob_imp_n <- as.data.frame(predict(nbayes_model_imp_n, test_n, type = "raw"))
+nbayes_prob.pos_imp_n <- nbayes_prob_imp_n$S
+
+nbayes_roc_imp_n <- prediction(predictions = nbayes_prob.pos_imp_n, labels = test$Actividad)
+nbayes_perf_imp_n <- performance(nbayes_roc_imp_n, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc_imp_n <- performance(nbayes_roc_imp_n, measure = "auc")
+nbayes_auc_imp_n <- round(unlist(nbayes_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y laplace = `r params$laplace`
+
+```{r}
+nbayes_model_z <- naiveBayes(train_z, train$Actividad, laplace = params$laplace)
+
+nbayes_pred_z <- predict(nbayes_model_z, test_z)
+
+nbayes_eval_z <- confusionMatrix(nbayes_pred_z, test$Actividad, positive = "S")
+nbayes_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob_z <- as.data.frame(predict(nbayes_model_z, test_z, type = "raw"))
+nbayes_prob.pos_z <- nbayes_prob_z$S
+
+nbayes_roc_z <- prediction(predictions = nbayes_prob.pos_z, labels = test$Actividad)
+nbayes_perf_z <- performance(nbayes_roc_z, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc_z <- performance(nbayes_roc_z, measure = "auc")
+nbayes_auc_z <- round(unlist(nbayes_perf.auc_z@y.values), 3)
+```
+
+
+Modelo datos normalización z y laplace = `r params$laplace_imp`
+
+```{r}
+nbayes_model_imp_z <- naiveBayes(train_z, train$Actividad, laplace = params$laplace_imp)
+
+nbayes_pred_imp_z <- predict(nbayes_model_imp_z, test_z)
+
+nbayes_eval_imp_z <- confusionMatrix(nbayes_pred_imp_z, test$Actividad, positive = "S")
+nbayes_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+nbayes_prob_imp_z <- as.data.frame(predict(nbayes_model_imp_z, test_z, type = "raw"))
+nbayes_prob.pos_imp_z <- nbayes_prob_imp_z$S
+
+nbayes_roc_imp_z <- prediction(predictions = nbayes_prob.pos_imp_z, labels = test$Actividad)
+nbayes_perf_imp_z <- performance(nbayes_roc_imp_z, measure = "tpr", x.measure = "fpr")
+nbayes_perf.auc_imp_z <- performance(nbayes_roc_imp_z, measure = "auc")
+nbayes_auc_imp_z <- round(unlist(nbayes_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla resultados
+
+```{r}
+nbayes_Modelo <- rep("Naive Bayes", 6)
+
+nbayes_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+nbayes_Parametro <- rep(c(paste("laplace = ", params$laplace), paste("laplace = ", params$laplace_imp)), 3)
+
+nbayes_TP <- c(nbayes_eval[["table"]][4],
+            nbayes_eval_imp[["table"]][4],
+            nbayes_eval_n[["table"]][4],
+            nbayes_eval_imp_n[["table"]][4],
+            nbayes_eval_z[["table"]][4],
+            nbayes_eval_imp_z[["table"]][4])
+
+nbayes_TN <- c(nbayes_eval[["table"]][1],
+            nbayes_eval_imp[["table"]][1],
+            nbayes_eval_n[["table"]][1],
+            nbayes_eval_imp_n[["table"]][1],
+            nbayes_eval_z[["table"]][1],
+            nbayes_eval_imp_z[["table"]][1])
+
+nbayes_FP <- c(nbayes_eval[["table"]][2],
+            nbayes_eval_imp[["table"]][2],
+            nbayes_eval_n[["table"]][2],
+            nbayes_eval_imp_n[["table"]][2],
+            nbayes_eval_z[["table"]][2],
+            nbayes_eval_imp_z[["table"]][2])
+
+nbayes_FN <- c(nbayes_eval[["table"]][3],
+            nbayes_eval_imp[["table"]][3],
+            nbayes_eval_n[["table"]][3],
+            nbayes_eval_imp_n[["table"]][3],
+            nbayes_eval_z[["table"]][3],
+            nbayes_eval_imp_z[["table"]][3])
+
+nbayes_Sensibilidad <- c(round(nbayes_eval[["byClass"]][1], 4),
+                      round(nbayes_eval_imp[["byClass"]][1], 4),
+                      round(nbayes_eval_n[["byClass"]][1], 4),
+                      round(nbayes_eval_imp_n[["byClass"]][1], 4),
+                      round(nbayes_eval_z[["byClass"]][1], 4),
+                      round(nbayes_eval_imp_z[["byClass"]][1], 4))
+
+nbayes_Especificidad <- c(round(nbayes_eval[["byClass"]][2], 4),
+                      round(nbayes_eval_imp[["byClass"]][2], 4),
+                      round(nbayes_eval_n[["byClass"]][2], 4),
+                      round(nbayes_eval_imp_n[["byClass"]][2], 4),
+                      round(nbayes_eval_z[["byClass"]][2], 4),
+                      round(nbayes_eval_imp_z[["byClass"]][2], 4))
+
+nbayes_Accuracy <- c(round(nbayes_eval[["overall"]][1], 4),
+                  round(nbayes_eval_imp[["overall"]][1], 4),
+                  round(nbayes_eval_n[["overall"]][1], 4),
+                  round(nbayes_eval_imp_n[["overall"]][1], 4),
+                  round(nbayes_eval_z[["overall"]][1], 4),
+                  round(nbayes_eval_imp_z[["overall"]][1], 4))
+
+nbayes_Kappa <- c(round(nbayes_eval[["overall"]][2], 4),
+                  round(nbayes_eval_imp[["overall"]][2], 4),
+                  round(nbayes_eval_n[["overall"]][2], 4),
+                  round(nbayes_eval_imp_n[["overall"]][2], 4),
+                  round(nbayes_eval_z[["overall"]][2], 4),
+                  round(nbayes_eval_imp_z[["overall"]][2], 4))
+
+nbayes_AUC <- c(round(nbayes_auc, 4),
+             round(nbayes_auc_imp, 4),
+             round(nbayes_auc_n, 4),
+             round(nbayes_auc_imp_n, 4),
+             round(nbayes_auc_z, 4),
+             round(nbayes_auc_imp_z, 4))
+
+
+nbayes_tabla <- data.frame(numeracion, nbayes_Modelo, nbayes_Normalizacion, nbayes_Parametro, nbayes_TP, nbayes_TN, nbayes_FP, nbayes_FN, nbayes_Sensibilidad, nbayes_Especificidad, nbayes_Accuracy, nbayes_Kappa, nbayes_AUC)
+```
+
+```{r message=FALSE}
+knitr::kable(nbayes_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas curva ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(nbayes_perf, main = paste("ROC curve Naive Bayes Laplace =", params$laplace), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc), cex = 1.25)
+
+plot(nbayes_perf_imp, main = paste("ROC curve Naive Bayes Laplace =", params$laplace_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc_imp), cex = 1.25)
+
+plot(nbayes_perf_n, main = paste("ROC curve Naive Bayes (n) Laplace =", params$laplace), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc_n), cex = 1.25)
+
+plot(nbayes_perf_imp_n, main = paste("ROC curve Naive Bayes (n) Laplace =", params$laplace_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc_imp_n), cex = 1.25)
+
+plot(nbayes_perf_z, main = paste("ROC curve Naive Bayes (z) Laplace =", params$laplace), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc_z), cex = 1.25)
+
+plot(nbayes_perf_imp_z, main = paste("ROC curve Naive Bayes (z) Laplace =", params$laplace_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", nbayes_auc_imp_z), cex = 1.25)
+```
+
+
+
+## Redes neuronales artificiales
+
+
+Modelo datos sin normalizar y hidden = `r params$hidden`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model <- neuralnet(Actividad ~ ., data = train, hidden = params$hidden, linear.output = FALSE)
+
+
+ann_pred <- compute(ann_model, test_sin)
+ann_idx <- max.col(ann_pred$net.result)
+ann_pred_class <- factor(ann_idx, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval <- confusionMatrix(ann_pred_class, test$Actividad, positive = "S")
+ann_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ann_prob <- as.data.frame(ann_pred$net.result)
+ann_prob.pos <- ann_prob$V2
+
+ann_roc <- prediction(predictions = ann_prob.pos, labels = test$Actividad)
+ann_perf <- performance(ann_roc, measure = "tpr", x.measure = "fpr")
+ann_perf.auc <- performance(ann_roc, measure = "auc")
+ann_auc <- round(unlist(ann_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y hidden = `r params$hidden_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model_imp <- neuralnet(Actividad ~ ., data = train, hidden = params$hidden_imp, linear.output = FALSE)
+
+
+ann_pred_imp <- compute(ann_model_imp, test_sin)
+ann_idx_imp <- max.col(ann_pred_imp$net.result)
+ann_pred_class_imp <- factor(ann_idx_imp, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval_imp <- confusionMatrix(ann_pred_class_imp, test$Actividad, positive = "S")
+ann_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ann_prob_imp <- as.data.frame(ann_pred_imp$net.result)
+ann_prob.pos_imp <- ann_prob_imp$V2
+
+ann_roc_imp <- prediction(predictions = ann_prob.pos_imp, labels = test$Actividad)
+ann_perf_imp <- performance(ann_roc_imp, measure = "tpr", x.measure = "fpr")
+ann_perf.auc_imp <- performance(ann_roc_imp, measure = "auc")
+ann_auc_imp <- round(unlist(ann_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y hidden = `r params$hidden`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model_n <- neuralnet(Actividad ~ ., data = train_n_ftr, hidden = params$hidden, linear.output = FALSE)
+
+
+ann_pred_n <- compute(ann_model_n, test_n)
+ann_idx_n <- max.col(ann_pred_n$net.result)
+ann_pred_class_n <- factor(ann_idx_n, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval_n <- confusionMatrix(ann_pred_class_n, test$Actividad, positive = "S")
+ann_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ann_prob_n <- as.data.frame(ann_pred_n$net.result)
+ann_prob.pos_n <- ann_prob_n$V2
+
+ann_roc_n <- prediction(predictions = ann_prob.pos_n, labels = test$Actividad)
+ann_perf_n <- performance(ann_roc_n, measure = "tpr", x.measure = "fpr")
+ann_perf.auc_n <- performance(ann_roc_n, measure = "auc")
+ann_auc_n <- round(unlist(ann_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y hidden = `r params$hidden_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model_imp_n <- neuralnet(Actividad ~ ., data = train_n_ftr, hidden = params$hidden_imp, linear.output = FALSE)
+
+
+ann_pred_imp_n <- compute(ann_model_imp_n, test_n)
+ann_idx_imp_n <- max.col(ann_pred_imp_n$net.result)
+ann_pred_class_imp_n <- factor(ann_idx_imp_n, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval_imp_n <- confusionMatrix(ann_pred_class_imp_n, test$Actividad, positive = "S")
+ann_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ann_prob_imp_n <- as.data.frame(ann_pred_imp_n$net.result)
+ann_prob.pos_imp_n <- ann_prob_imp_n$V2
+
+ann_roc_imp_n <- prediction(predictions = ann_prob.pos_imp_n, labels = test$Actividad)
+ann_perf_imp_n <- performance(ann_roc_imp_n, measure = "tpr", x.measure = "fpr")
+ann_perf.auc_imp_n <- performance(ann_roc_imp_n, measure = "auc")
+ann_auc_imp_n <- round(unlist(ann_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y hidden = `r params$hidden`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model_z <- neuralnet(Actividad ~ ., data = train_z_ftr, hidden = params$hidden, linear.output = FALSE)
+
+
+ann_pred_z <- compute(ann_model_z, test_z)
+ann_idx_z <- max.col(ann_pred_z$net.result)
+ann_pred_class_z <- factor(ann_idx_z, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval_z <- confusionMatrix(ann_pred_class_z, test$Actividad, positive = "S")
+ann_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r include=FALSE}
+ann_prob_z <- as.data.frame(ann_pred_z$net.result)
+ann_prob.pos_z <- ann_prob_z$V2
+
+ann_roc_z <- prediction(predictions = ann_prob.pos_z, labels = test$Actividad)
+ann_perf_z <- performance(ann_roc_z, measure = "tpr", x.measure = "fpr")
+ann_perf.auc_z <- performance(ann_roc_z, measure = "auc")
+ann_auc_z <- round(unlist(ann_perf.auc_z@y.values), 3)
+```
+
+
+Modelo datos normalización z y hidden = `r params$hidden_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+ann_model_imp_z <- neuralnet(Actividad ~ ., data = train_z_ftr, hidden = params$hidden_imp, linear.output = FALSE)
+
+
+ann_pred_imp_z <- compute(ann_model_imp_z, test_z)
+ann_idx_imp_z <- max.col(ann_pred_imp_z$net.result)
+ann_pred_class_imp_z <- factor(ann_idx_imp_z, levels = 1:length(levels(train$Actividad)), labels = levels(train$Actividad))
+
+
+ann_eval_imp_z <- confusionMatrix(ann_pred_class_imp_z, test$Actividad, positive = "S")
+ann_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ann_prob_imp_z <- as.data.frame(ann_pred_imp_z$net.result)
+ann_prob.pos_imp_z <- ann_prob_imp_z$V2
+
+ann_roc_imp_z <- prediction(predictions = ann_prob.pos_imp_z, labels = test$Actividad)
+ann_perf_imp_z <- performance(ann_roc_imp_z, measure = "tpr", x.measure = "fpr")
+ann_perf.auc_imp_z <- performance(ann_roc_imp_z, measure = "auc")
+ann_auc_imp_z <- round(unlist(ann_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla resultados
+
+```{r}
+ann_Modelo <- rep("ANN", 6)
+
+ann_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+ann_Parametro <- rep(c(paste("hidden = ", params$hidden), paste("hidden = ", params$hidden_imp[1], ",", params$hidden_imp[2])), 3)
+
+ann_TP <- c(ann_eval[["table"]][4],
+            ann_eval_imp[["table"]][4],
+            ann_eval_n[["table"]][4],
+            ann_eval_imp_n[["table"]][4],
+            ann_eval_z[["table"]][4],
+            ann_eval_imp_z[["table"]][4])
+
+ann_TN <- c(ann_eval[["table"]][1],
+            ann_eval_imp[["table"]][1],
+            ann_eval_n[["table"]][1],
+            ann_eval_imp_n[["table"]][1],
+            ann_eval_z[["table"]][1],
+            ann_eval_imp_z[["table"]][1])
+
+ann_FP <- c(ann_eval[["table"]][2],
+            ann_eval_imp[["table"]][2],
+            ann_eval_n[["table"]][2],
+            ann_eval_imp_n[["table"]][2],
+            ann_eval_z[["table"]][2],
+            ann_eval_imp_z[["table"]][2])
+
+ann_FN <- c(ann_eval[["table"]][3],
+            ann_eval_imp[["table"]][3],
+            ann_eval_n[["table"]][3],
+            ann_eval_imp_n[["table"]][3],
+            ann_eval_z[["table"]][3],
+            ann_eval_imp_z[["table"]][3])
+
+ann_Sensibilidad <- c(round(ann_eval[["byClass"]][1], 4),
+                      round(ann_eval_imp[["byClass"]][1], 4),
+                      round(ann_eval_n[["byClass"]][1], 4),
+                      round(ann_eval_imp_n[["byClass"]][1], 4),
+                      round(ann_eval_z[["byClass"]][1], 4),
+                      round(ann_eval_imp_z[["byClass"]][1], 4))
+
+ann_Especificidad <- c(round(ann_eval[["byClass"]][2], 4),
+                       round(ann_eval_imp[["byClass"]][2], 4),
+                       round(ann_eval_n[["byClass"]][2], 4),
+                       round(ann_eval_imp_n[["byClass"]][2], 4),
+                       round(ann_eval_z[["byClass"]][2], 4),
+                       round(ann_eval_imp_z[["byClass"]][2], 4))
+
+ann_Accuracy <- c(round(ann_eval[["overall"]][1], 4),
+                  round(ann_eval_imp[["overall"]][1], 4),
+                  round(ann_eval_n[["overall"]][1], 4),
+                  round(ann_eval_imp_n[["overall"]][1], 4),
+                  round(ann_eval_z[["overall"]][1], 4),
+                  round(ann_eval_imp_z[["overall"]][1], 4))
+
+ann_Kappa <- c(round(ann_eval[["overall"]][2], 4),
+               round(ann_eval_imp[["overall"]][2], 4),
+               round(ann_eval_n[["overall"]][2], 4),
+               round(ann_eval_imp_n[["overall"]][2], 4),
+               round(ann_eval_z[["overall"]][2], 4),
+               round(ann_eval_imp_z[["overall"]][2], 4))
+
+ann_AUC <- c(round(ann_auc, 4),
+             round(ann_auc_imp, 4),
+             round(ann_auc_n, 4),
+             round(ann_auc_imp_n, 4),
+             round(ann_auc_z, 4),
+             round(ann_auc_imp_z, 4))
+
+
+ann_tabla <- data.frame(numeracion, ann_Modelo, ann_Normalizacion, ann_Parametro, ann_TP, ann_TN, ann_FP, ann_FN, ann_Sensibilidad, ann_Especificidad, ann_Accuracy, ann_Kappa, ann_AUC)
+```
+
+```{r message=FALSE}
+knitr::kable(ann_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(ann_perf, main = paste("ROC curve ANN hidden =", params$hidden, "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc), cex = 1.25)
+
+plot(ann_perf_imp, main = paste("ROC curve ANN hidden =", params$hidden_imp[1],"and", params$hidden_imp[2], "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc_imp), cex = 1.25)
+
+plot(ann_perf_n, main = paste("ROC curve ANN (n) hidden =", params$hidden, "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc_n), cex = 1.25)
+
+plot(ann_perf_imp_n, main = paste("ROC curve ANN (n) hidden =", params$hidden_imp[1],"and", params$hidden_imp[2], "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc_imp_n), cex = 1.25)
+
+plot(ann_perf_z, main = paste("ROC curve ANN (z) hidden =", params$hidden, "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc_z), cex = 1.25)
+
+plot(ann_perf_imp_z, main = paste("ROC curve ANN (z) hidden =", params$hidden_imp[1],"and", params$hidden_imp[2], "nodes"), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ann_auc_imp_z), cex = 1.25)
+```
+
+
+
+## Máquinas de soporte vectorial
+
+
+Modelo datos sin normalizar y kernel = `r params$kernel`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model <- ksvm(Actividad ~ ., data = train, kernel = params$kernel, prob.model = TRUE, scaled = FALSE)
+
+svm_pred <- predict(svm_model, test_sin)
+
+svm_eval <- confusionMatrix(svm_pred, test$Actividad, positive = "S")
+svm_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob <- as.data.frame(predict(svm_model, test_sin, type = "probabilities"))
+svm_prob.pos <- svm_prob$S
+
+svm_roc <- prediction(predictions = svm_prob.pos, labels = test$Actividad)
+svm_perf <- performance(svm_roc, measure = "tpr", x.measure = "fpr")
+svm_perf.auc <- performance(svm_roc, measure = "auc")
+svm_auc <- round(unlist(svm_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y kernel = `r params$kernel_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model_imp <- ksvm(Actividad ~ ., data = train, kernel = params$kernel_imp, prob.model = TRUE, scaled = FALSE)
+
+svm_pred_imp <- predict(svm_model_imp, test_sin)
+
+svm_eval_imp <- confusionMatrix(svm_pred_imp, test$Actividad, positive = "S")
+svm_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob_imp <- as.data.frame(predict(svm_model_imp, test_sin, type = "probabilities"))
+svm_prob.pos_imp <- svm_prob_imp$S
+
+svm_roc_imp <- prediction(predictions = svm_prob.pos_imp, labels = test$Actividad)
+svm_perf_imp <- performance(svm_roc_imp, measure = "tpr", x.measure = "fpr")
+svm_perf.auc_imp <- performance(svm_roc_imp, measure = "auc")
+svm_auc_imp <- round(unlist(svm_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y kernel = `r params$kernel`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model_n <- ksvm(Actividad ~ ., data = train_n_ftr, kernel = params$kernel, prob.model = TRUE, scaled = FALSE)
+
+svm_pred_n <- predict(svm_model_n, test_n)
+
+svm_eval_n <- confusionMatrix(svm_pred_n, test$Actividad, positive = "S")
+svm_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob_n <- as.data.frame(predict(svm_model_n, test_n, type = "probabilities"))
+svm_prob.pos_n <- svm_prob_n$S
+
+svm_roc_n <- prediction(predictions = svm_prob.pos_n, labels = test$Actividad)
+svm_perf_n <- performance(svm_roc_n, measure = "tpr", x.measure = "fpr")
+svm_perf.auc_n <- performance(svm_roc_n, measure = "auc")
+svm_auc_n <- round(unlist(svm_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y kernel = `r params$kernel_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model_imp_n <- ksvm(Actividad ~ ., data = train_n_ftr, kernel = params$kernel_imp, prob.model = TRUE, scaled = FALSE)
+
+svm_pred_imp_n <- predict(svm_model_imp_n, test_n)
+
+svm_eval_imp_n <- confusionMatrix(svm_pred_imp_n, test$Actividad, positive = "S")
+svm_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob_imp_n <- as.data.frame(predict(svm_model_imp_n, test_n, type = "probabilities"))
+svm_prob.pos_imp_n <- svm_prob_imp_n$S
+
+svm_roc_imp_n <- prediction(predictions = svm_prob.pos_imp_n, labels = test$Actividad)
+svm_perf_imp_n <- performance(svm_roc_imp_n, measure = "tpr", x.measure = "fpr")
+svm_perf.auc_imp_n <- performance(svm_roc_imp_n, measure = "auc")
+svm_auc_imp_n <- round(unlist(svm_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y kernel = `r params$kernel`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model_z <- ksvm(Actividad ~ ., data = train_z_ftr, kernel = params$kernel, prob.model = TRUE, scaled = FALSE)
+
+svm_pred_z <- predict(svm_model_z, test_z)
+
+svm_eval_z <- confusionMatrix(svm_pred_z, test$Actividad, positive = "S")
+svm_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob_z <- as.data.frame(predict(svm_model_z, test_z, type = "probabilities"))
+svm_prob.pos_z <- svm_prob_z$S
+
+svm_roc_z <- prediction(predictions = svm_prob.pos_z, labels = test$Actividad)
+svm_perf_z <- performance(svm_roc_z, measure = "tpr", x.measure = "fpr")
+svm_perf.auc_z <- performance(svm_roc_z, measure = "auc")
+svm_auc_z <- round(unlist(svm_perf.auc_z@y.values), 3)
+```
+
+
+Modelo datos normalización z y kernel = `r params$kernel_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+svm_model_imp_z <- ksvm(Actividad ~ ., data = train_z_ftr, kernel = params$kernel_imp, prob.model = TRUE, scaled = FALSE)
+
+svm_pred_imp_z <- predict(svm_model_imp_z, test_z)
+
+svm_eval_imp_z <- confusionMatrix(svm_pred_imp_z, test$Actividad, positive = "S")
+svm_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+svm_prob_imp_z <- as.data.frame(predict(svm_model_imp_z, test_z, type = "probabilities"))
+svm_prob.pos_imp_z <- svm_prob_imp_z$S
+
+svm_roc_imp_z <- prediction(predictions = svm_prob.pos_imp_z, labels = test$Actividad)
+svm_perf_imp_z <- performance(svm_roc_imp_z, measure = "tpr", x.measure = "fpr")
+svm_perf.auc_imp_z <- performance(svm_roc_imp_z, measure = "auc")
+svm_auc_imp_z <- round(unlist(svm_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla resultados
+
+```{r}
+svm_Modelo <- rep("SVM", 6)
+
+svm_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+svm_Parametro <- rep(c(paste("kernel = ", params$kernel), paste("kernel = ", params$kernel_imp)), 3)
+
+svm_TP <- c(svm_eval[["table"]][4],
+            svm_eval_imp[["table"]][4],
+            svm_eval_n[["table"]][4],
+            svm_eval_imp_n[["table"]][4],
+            svm_eval_z[["table"]][4],
+            svm_eval_imp_z[["table"]][4])
+
+svm_TN <- c(svm_eval[["table"]][1],
+            svm_eval_imp[["table"]][1],
+            svm_eval_n[["table"]][1],
+            svm_eval_imp_n[["table"]][1],
+            svm_eval_z[["table"]][1],
+            svm_eval_imp_z[["table"]][1])
+
+svm_FP <- c(svm_eval[["table"]][2],
+            svm_eval_imp[["table"]][2],
+            svm_eval_n[["table"]][2],
+            svm_eval_imp_n[["table"]][2],
+            svm_eval_z[["table"]][2],
+            svm_eval_imp_z[["table"]][2])
+
+svm_FN <- c(svm_eval[["table"]][3],
+            svm_eval_imp[["table"]][3],
+            svm_eval_n[["table"]][3],
+            svm_eval_imp_n[["table"]][3],
+            svm_eval_z[["table"]][3],
+            svm_eval_imp_z[["table"]][3])
+
+svm_Sensibilidad <- c(round(svm_eval[["byClass"]][1], 4),
+                      round(svm_eval_imp[["byClass"]][1], 4),
+                      round(svm_eval_n[["byClass"]][1], 4),
+                      round(svm_eval_imp_n[["byClass"]][1], 4),
+                      round(svm_eval_z[["byClass"]][1], 4),
+                      round(svm_eval_imp_z[["byClass"]][1], 4))
+
+svm_Especificidad <- c(round(svm_eval[["byClass"]][2], 4),
+                       round(svm_eval_imp[["byClass"]][2], 4),
+                       round(svm_eval_n[["byClass"]][2], 4),
+                       round(svm_eval_imp_n[["byClass"]][2], 4),
+                       round(svm_eval_z[["byClass"]][2], 4),
+                       round(svm_eval_imp_z[["byClass"]][2], 4))
+
+svm_Accuracy <- c(round(svm_eval[["overall"]][1], 4),
+                  round(svm_eval_imp[["overall"]][1], 4),
+                  round(svm_eval_n[["overall"]][1], 4),
+                  round(svm_eval_imp_n[["overall"]][1], 4),
+                  round(svm_eval_z[["overall"]][1], 4),
+                  round(svm_eval_imp_z[["overall"]][1], 4))
+
+svm_Kappa <- c(round(svm_eval[["overall"]][2], 4),
+               round(svm_eval_imp[["overall"]][2], 4),
+               round(svm_eval_n[["overall"]][2], 4),
+               round(svm_eval_imp_n[["overall"]][2], 4),
+               round(svm_eval_z[["overall"]][2], 4),
+               round(svm_eval_imp_z[["overall"]][2], 4))
+
+svm_AUC <- c(round(svm_auc, 4),
+             round(svm_auc_imp, 4),
+             round(svm_auc_n, 4),
+             round(svm_auc_imp_n, 4),
+             round(svm_auc_z, 4),
+             round(svm_auc_imp_z, 4))
+
+
+svm_tabla <- data.frame(numeracion, svm_Modelo, svm_Normalizacion, svm_Parametro, svm_TP, svm_TN, svm_FP, svm_FN, svm_Sensibilidad, svm_Especificidad, svm_Accuracy, svm_Kappa, svm_AUC)
+```
+
+```{r message=FALSE}
+knitr::kable(svm_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(svm_perf, main = paste("ROC curve SVM Kernel =", params$kernel), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc), cex = 1.25)
+
+plot(svm_perf_imp, main = paste("ROC curve SVM Kernel =", params$kernel_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc_imp), cex = 1.25)
+
+plot(svm_perf_n, main = paste("ROC curve SVM (n) Kernel =", params$kernel), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc_n), cex = 1.25)
+
+plot(svm_perf_imp_n, main = paste("ROC curve SVM (n) Kernel =", params$kernel_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc_imp_n), cex = 1.25)
+
+plot(svm_perf_z, main = paste("ROC curve SVM (z) Kernel =", params$kernel), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc_z), cex = 1.25)
+
+plot(svm_perf_imp_z, main = paste("ROC curve SVM (z) Kernel =", params$kernel_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", svm_auc_imp_z), cex = 1.25)
+```
+
+
+
+## Árboles de decisión
+
+
+Modelo datos sin normalizar y trials = `r params$trials`
+
+```{r}
+ad_model <- C5.0(train_sin, train$Actividad, trials = params$trials)
+
+ad_pred <- predict(ad_model, test_sin)
+
+ad_eval <- confusionMatrix(ad_pred, test$Actividad, positive = "S")
+ad_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob <- as.data.frame(predict(ad_model, test_sin, type = "prob"))
+ad_prob.pos <- ad_prob$S
+
+ad_roc <- prediction(predictions = ad_prob.pos, labels = test$Actividad)
+ad_perf <- performance(ad_roc, measure = "tpr", x.measure = "fpr")
+ad_perf.auc <- performance(ad_roc, measure = "auc")
+ad_auc <- round(unlist(ad_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y trials = `r params$trials_imp`
+
+```{r}
+ad_model_imp <- C5.0(train_sin, train$Actividad, trials = params$trials_imp)
+
+ad_pred_imp <- predict(ad_model_imp, test_sin)
+
+ad_eval_imp <- confusionMatrix(ad_pred_imp, test$Actividad, positive = "S")
+ad_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob_imp <- as.data.frame(predict(ad_model_imp, test_sin, type = "prob"))
+ad_prob.pos_imp <- ad_prob_imp$S
+
+ad_roc_imp <- prediction(predictions = ad_prob.pos_imp, labels = test$Actividad)
+ad_perf_imp <- performance(ad_roc_imp, measure = "tpr", x.measure = "fpr")
+ad_perf.auc_imp <- performance(ad_roc_imp, measure = "auc")
+ad_auc_imp <- round(unlist(ad_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y trials = `r params$trials`
+
+```{r}
+ad_model_n <- C5.0(train_n, train$Actividad, trials = params$trials)
+
+ad_pred_n <- predict(ad_model_n, test_n)
+
+ad_eval_n <- confusionMatrix(ad_pred_n, test$Actividad, positive = "S")
+ad_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob_n <- as.data.frame(predict(ad_model_n, test_n, type = "prob"))
+ad_prob.pos_n <- ad_prob_n$S
+
+ad_roc_n <- prediction(predictions = ad_prob.pos_n, labels = test$Actividad)
+ad_perf_n <- performance(ad_roc_n, measure = "tpr", x.measure = "fpr")
+ad_perf.auc_n <- performance(ad_roc_n, measure = "auc")
+ad_auc_n <- round(unlist(ad_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y trials = `r params$trials_imp`
+
+```{r}
+ad_model_imp_n <- C5.0(train_n, train$Actividad, trials = params$trials_imp)
+
+ad_pred_imp_n <- predict(ad_model_imp_n, test_n)
+
+ad_eval_imp_n <- confusionMatrix(ad_pred_imp_n, test$Actividad, positive = "S")
+ad_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob_imp_n <- as.data.frame(predict(ad_model_imp_n, test_n, type = "prob"))
+ad_prob.pos_imp_n <- ad_prob_imp_n$S
+
+ad_roc_imp_n <- prediction(predictions = ad_prob.pos_imp_n, labels = test$Actividad)
+ad_perf_imp_n <- performance(ad_roc_imp_n, measure = "tpr", x.measure = "fpr")
+ad_perf.auc_imp_n <- performance(ad_roc_imp_n, measure = "auc")
+ad_auc_imp_n <- round(unlist(ad_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y trials = `r params$trials`
+
+```{r}
+ad_model_z <- C5.0(train_z, train$Actividad, trials = params$trials)
+
+ad_pred_z <- predict(ad_model_z, test_z)
+
+ad_eval_z <- confusionMatrix(ad_pred_z, test$Actividad, positive = "S")
+ad_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob_z <- as.data.frame(predict(ad_model_z, test_z, type = "prob"))
+ad_prob.pos_z <- ad_prob_z$S
+
+ad_roc_z <- prediction(predictions = ad_prob.pos_z, labels = test$Actividad)
+ad_perf_z <- performance(ad_roc_z, measure = "tpr", x.measure = "fpr")
+ad_perf.auc_z <- performance(ad_roc_z, measure = "auc")
+ad_auc_z <- round(unlist(ad_perf.auc_z@y.values), 3)
+```
+
+
+Modelo datos normalización z y trials = `r params$trials_imp`
+
+```{r}
+ad_model_imp_z <- C5.0(train_z, train$Actividad, trials = params$trials_imp)
+
+ad_pred_imp_z <- predict(ad_model_imp_z, test_z)
+
+ad_eval_imp_z <- confusionMatrix(ad_pred_imp_z, test$Actividad, positive = "S")
+ad_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+ad_prob_imp_z <- as.data.frame(predict(ad_model_imp_z, test_z, type = "prob"))
+ad_prob.pos_imp_z <- ad_prob_imp_z$S
+
+ad_roc_imp_z <- prediction(predictions = ad_prob.pos_imp_z, labels = test$Actividad)
+ad_perf_imp_z <- performance(ad_roc_imp_z, measure = "tpr", x.measure = "fpr")
+ad_perf.auc_imp_z <- performance(ad_roc_imp_z, measure = "auc")
+ad_auc_imp_z <- round(unlist(ad_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla de resultados
+
+```{r}
+ad_Modelo <- rep("Árboles decisión", 6)
+
+ad_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+ad_Parametro <- rep(c(paste("trials = ", params$trials), paste("trials = ", params$trials_imp)), 3)
+
+ad_TP <- c(ad_eval[["table"]][4],
+           ad_eval_imp[["table"]][4],
+           ad_eval_n[["table"]][4],
+           ad_eval_imp_n[["table"]][4],
+           ad_eval_z[["table"]][4],
+           ad_eval_imp_z[["table"]][4])
+
+ad_TN <- c(ad_eval[["table"]][1],
+           ad_eval_imp[["table"]][1],
+           ad_eval_n[["table"]][1],
+           ad_eval_imp_n[["table"]][1],
+           ad_eval_z[["table"]][1],
+           ad_eval_imp_z[["table"]][1])
+
+ad_FP <- c(ad_eval[["table"]][2],
+           ad_eval_imp[["table"]][2],
+           ad_eval_n[["table"]][2],
+           ad_eval_imp_n[["table"]][2],
+           ad_eval_z[["table"]][2],
+           ad_eval_imp_z[["table"]][2])
+
+ad_FN <- c(ad_eval[["table"]][3],
+           ad_eval_imp[["table"]][3],
+           ad_eval_n[["table"]][3],
+           ad_eval_imp_n[["table"]][3],
+           ad_eval_z[["table"]][3],
+           ad_eval_imp_z[["table"]][3])
+
+ad_Sensibilidad <- c(round(ad_eval[["byClass"]][1], 4),
+                     round(ad_eval_imp[["byClass"]][1], 4),
+                     round(ad_eval_n[["byClass"]][1], 4),
+                     round(ad_eval_imp_n[["byClass"]][1], 4),
+                     round(ad_eval_z[["byClass"]][1], 4),
+                     round(ad_eval_imp_z[["byClass"]][1], 4))
+
+ad_Especificidad <- c(round(ad_eval[["byClass"]][2], 4),
+                      round(ad_eval_imp[["byClass"]][2], 4),
+                      round(ad_eval_n[["byClass"]][2], 4),
+                      round(ad_eval_imp_n[["byClass"]][2], 4),
+                      round(ad_eval_z[["byClass"]][2], 4),
+                      round(ad_eval_imp_z[["byClass"]][2], 4))
+
+ad_Accuracy <- c(round(ad_eval[["overall"]][1], 4),
+                 round(ad_eval_imp[["overall"]][1], 4),
+                 round(ad_eval_n[["overall"]][1], 4),
+                 round(ad_eval_imp_n[["overall"]][1], 4),
+                 round(ad_eval_z[["overall"]][1], 4),
+                 round(ad_eval_imp_z[["overall"]][1], 4))
+
+ad_Kappa <- c(round(ad_eval[["overall"]][2], 4),
+              round(ad_eval_imp[["overall"]][2], 4),
+              round(ad_eval_n[["overall"]][2], 4),
+              round(ad_eval_imp_n[["overall"]][2], 4),
+              round(ad_eval_z[["overall"]][2], 4),
+              round(ad_eval_imp_z[["overall"]][2], 4))
+
+ad_AUC <- c(round(ad_auc, 4),
+            round(ad_auc_imp, 4),
+            round(ad_auc_n, 4),
+            round(ad_auc_imp_n, 4),
+            round(ad_auc_z, 4),
+            round(ad_auc_imp_z, 4))
+
+
+ad_tabla <- data.frame(numeracion, ad_Modelo, ad_Normalizacion, ad_Parametro, ad_TP, ad_TN, ad_FP, ad_FN, ad_Sensibilidad, ad_Especificidad, ad_Accuracy, ad_Kappa, ad_AUC)
+```
+
+```{r message=FALSE}
+knitr::kable(ad_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(ad_perf, main = paste("ROC curve Decision Tree Trials =", params$trials), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc), cex = 1.25)
+
+plot(ad_perf_imp, main = paste("ROC curve Decision Tree Trials =", params$trials_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc_imp), cex = 1.25)
+
+plot(ad_perf_n, main = paste("ROC curve Decision Tree (n) Trials =", params$trials), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc_n), cex = 1.25)
+
+plot(ad_perf_imp_n, main = paste("ROC curve Decision Tree (n) Trials =", params$trials_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc_imp_n), cex = 1.25)
+
+plot(ad_perf_z, main = paste("ROC curve Decision Tree (z) Trials =", params$trials), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc_z), cex = 1.25)
+
+plot(ad_perf_imp_z, main = paste("ROC curve Decision Tree (z) Trials =", params$trials_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", ad_auc_imp_z), cex = 1.25)
+```
+
+
+
+## Bosques aleatorios
+
+
+Modelo datos sin normalizar y mtry = `r params$mtry`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model <- randomForest(Actividad ~ ., data = train, mtry = params$mtry)
+
+rf_pred <- predict(rf_model, test_sin)
+
+rf_eval <- confusionMatrix(rf_pred, test$Actividad, positive = "S")
+rf_eval
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob <- as.data.frame(predict(rf_model, test_sin, type = "prob"))
+rf_prob.pos <- rf_prob$S
+
+rf_roc <- prediction(predictions = rf_prob.pos, labels = test$Actividad)
+rf_perf <- performance(rf_roc, measure = "tpr", x.measure = "fpr")
+rf_perf.auc <- performance(rf_roc, measure = "auc")
+rf_auc <- round(unlist(rf_perf.auc@y.values), 3)
+```
+
+
+Modelo datos sin normalizar y mtry = `r params$mtry_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model_imp <- randomForest(Actividad ~ ., data = train, mtry = params$mtry_imp)
+
+rf_pred_imp <- predict(rf_model_imp, test_sin)
+
+rf_eval_imp <- confusionMatrix(rf_pred_imp, test$Actividad, positive = "S")
+rf_eval_imp
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob_imp <- as.data.frame(predict(rf_model_imp, test_sin, type = "prob"))
+rf_prob.pos_imp <- rf_prob_imp$S
+
+rf_roc_imp <- prediction(predictions = rf_prob.pos_imp, labels = test$Actividad)
+rf_perf_imp <- performance(rf_roc_imp, measure = "tpr", x.measure = "fpr")
+rf_perf.auc_imp <- performance(rf_roc_imp, measure = "auc")
+rf_auc_imp <- round(unlist(rf_perf.auc_imp@y.values), 3)
+```
+
+
+Modelo datos normalización n y mtry = `r params$mtry`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model_n <- randomForest(Actividad ~ ., data = train_n_ftr, mtry = params$mtry)
+
+rf_pred_n <- predict(rf_model_n, test_n)
+
+rf_eval_n <- confusionMatrix(rf_pred_n, test$Actividad, positive = "S")
+rf_eval_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob_n <- as.data.frame(predict(rf_model_n, test_n, type = "prob"))
+rf_prob.pos_n <- rf_prob_n$S
+
+rf_roc_n <- prediction(predictions = rf_prob.pos_n, labels = test$Actividad)
+rf_perf_n <- performance(rf_roc_n, measure = "tpr", x.measure = "fpr")
+rf_perf.auc_n <- performance(rf_roc_n, measure = "auc")
+rf_auc_n <- round(unlist(rf_perf.auc_n@y.values), 3)
+```
+
+
+Modelo datos normalización n y mtry = `r params$mtry_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model_imp_n <- randomForest(Actividad ~ ., data = train_n_ftr, mtry = params$mtry_imp)
+
+rf_pred_imp_n <- predict(rf_model_imp_n, test_n)
+
+rf_eval_imp_n <- confusionMatrix(rf_pred_imp_n, test$Actividad, positive = "S")
+rf_eval_imp_n
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob_imp_n <- as.data.frame(predict(rf_model_imp_n, test_n, type = "prob"))
+rf_prob.pos_imp_n <- rf_prob_imp_n$S
+
+rf_roc_imp_n <- prediction(predictions = rf_prob.pos_imp_n, labels = test$Actividad)
+rf_perf_imp_n <- performance(rf_roc_imp_n, measure = "tpr", x.measure = "fpr")
+rf_perf.auc_imp_n <- performance(rf_roc_imp_n, measure = "auc")
+rf_auc_imp_n <- round(unlist(rf_perf.auc_imp_n@y.values), 3)
+```
+
+
+Modelo datos normalización z y mtry = `r params$mtry`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model_z <- randomForest(Actividad ~ ., data = train_z_ftr, mtry = params$mtry)
+
+rf_pred_z <- predict(rf_model_z, test_z)
+
+rf_eval_z <- confusionMatrix(rf_pred_z, test$Actividad, positive = "S")
+rf_eval_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob_z <- as.data.frame(predict(rf_model_z, test_z, type = "prob"))
+rf_prob.pos_z <- rf_prob_z$S
+
+rf_roc_z <- prediction(predictions = rf_prob.pos_z, labels = test$Actividad)
+rf_perf_z <- performance(rf_roc_z, measure = "tpr", x.measure = "fpr")
+rf_perf.auc_z <- performance(rf_roc_z, measure = "auc")
+rf_auc_z <- round(unlist(rf_perf.auc_z@y.values), 3)
+```
+
+
+Modelo datos normalización z y mtry = `r params$mtry_imp`
+
+```{r}
+set.seed(params$set_seed_models)
+
+rf_model_imp_z <- randomForest(Actividad ~ ., data = train_z_ftr, mtry = params$mtry_imp)
+
+rf_pred_imp_z <- predict(rf_model_imp_z, test_z)
+
+rf_eval_imp_z <- confusionMatrix(rf_pred_imp_z, test$Actividad, positive = "S")
+rf_eval_imp_z
+```
+
+
+Datos curva ROC del modelo anterior
+
+```{r}
+rf_prob_imp_z <- as.data.frame(predict(rf_model_imp_z, test_z, type = "prob"))
+rf_prob.pos_imp_z <- rf_prob_imp_z$S
+
+rf_roc_imp_z <- prediction(predictions = rf_prob.pos_imp_z, labels = test$Actividad)
+rf_perf_imp_z <- performance(rf_roc_imp_z, measure = "tpr", x.measure = "fpr")
+rf_perf.auc_imp_z <- performance(rf_roc_imp_z, measure = "auc")
+rf_auc_imp_z <- round(unlist(rf_perf.auc_imp_z@y.values), 3)
+```
+
+
+Tabla de resultados
+
+```{r}
+rf_Modelo <- rep("Bosques aleatorios", 6)
+
+rf_Normalizacion <- c("-", "-", "n", "n", "z", "z")
+
+rf_Parametro <- rep(c(paste("mtry = ", params$mtry), paste("mtry = ", params$mtry_imp)), 3)
+
+rf_TP <- c(rf_eval[["table"]][4],
+           rf_eval_imp[["table"]][4],
+           rf_eval_n[["table"]][4],
+           rf_eval_imp_n[["table"]][4],
+           rf_eval_z[["table"]][4],
+           rf_eval_imp_z[["table"]][4])
+
+rf_TN <- c(rf_eval[["table"]][1],
+           rf_eval_imp[["table"]][1],
+           rf_eval_n[["table"]][1],
+           rf_eval_imp_n[["table"]][1],
+           rf_eval_z[["table"]][1],
+           rf_eval_imp_z[["table"]][1])
+
+rf_FP <- c(rf_eval[["table"]][2],
+           rf_eval_imp[["table"]][2],
+           rf_eval_n[["table"]][2],
+           rf_eval_imp_n[["table"]][2],
+           rf_eval_z[["table"]][2],
+           rf_eval_imp_z[["table"]][2])
+
+rf_FN <- c(rf_eval[["table"]][3],
+           rf_eval_imp[["table"]][3],
+           rf_eval_n[["table"]][3],
+           rf_eval_imp_n[["table"]][3],
+           rf_eval_z[["table"]][3],
+           rf_eval_imp_z[["table"]][3])
+
+rf_Sensibilidad <- c(round(rf_eval[["byClass"]][1], 4),
+                     round(rf_eval_imp[["byClass"]][1], 4),
+                     round(rf_eval_n[["byClass"]][1], 4),
+                     round(rf_eval_imp_n[["byClass"]][1], 4),
+                     round(rf_eval_z[["byClass"]][1], 4),
+                     round(rf_eval_imp_z[["byClass"]][1], 4))
+
+rf_Especificidad <- c(round(rf_eval[["byClass"]][2], 4),
+                      round(rf_eval_imp[["byClass"]][2], 4),
+                      round(rf_eval_n[["byClass"]][2], 4),
+                      round(rf_eval_imp_n[["byClass"]][2], 4),
+                      round(rf_eval_z[["byClass"]][2], 4),
+                      round(rf_eval_imp_z[["byClass"]][2], 4))
+
+rf_Accuracy <- c(round(rf_eval[["overall"]][1], 4),
+                 round(rf_eval_imp[["overall"]][1], 4),
+                 round(rf_eval_n[["overall"]][1], 4),
+                 round(rf_eval_imp_n[["overall"]][1], 4),
+                 round(rf_eval_z[["overall"]][1], 4),
+                 round(rf_eval_imp_z[["overall"]][1], 4))
+
+rf_Kappa <- c(round(rf_eval[["overall"]][2], 4),
+              round(rf_eval_imp[["overall"]][2], 4),
+              round(rf_eval_n[["overall"]][2], 4),
+              round(rf_eval_imp_n[["overall"]][2], 4),
+              round(rf_eval_z[["overall"]][2], 4),
+              round(rf_eval_imp_z[["overall"]][2], 4))
+
+rf_AUC <- c(round(rf_auc, 4),
+            round(rf_auc_imp, 4),
+            round(rf_auc_n, 4),
+            round(rf_auc_imp_n, 4),
+            round(rf_auc_z, 4),
+            round(rf_auc_imp_z, 4))
+
+
+rf_tabla <- data.frame(numeracion, rf_Modelo, rf_Normalizacion, rf_Parametro, rf_TP, rf_TN, rf_FP, rf_FN, rf_Sensibilidad, rf_Especificidad, rf_Accuracy, rf_Kappa, rf_AUC)
+```
+
+```{r message=FALSE}
+knitr::kable(rf_tabla, col.names = colnames_tabla)
+```
+
+
+Gráficas ROC
+
+```{r fig.dim = c(10,8)}
+par(mfrow=c(3,2))
+
+plot(rf_perf, main = paste("ROC curve Random Forest mtry =", params$mtry), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc), cex = 1.25)
+
+plot(rf_perf_imp, main = paste("ROC curve Random Forest mtry =", params$mtry_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc_imp), cex = 1.25)
+
+plot(rf_perf_n, main = paste("ROC curve Random Forest (n) mtry =", params$mtry), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc_n), cex = 1.25)
+
+plot(rf_perf_imp_n, main = paste("ROC curve Random Forest (n) mtry =", params$mtry_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc_imp_n), cex = 1.25)
+
+plot(rf_perf_z, main = paste("ROC curve Random Forest (z) mtry =", params$mtry), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc_z), cex = 1.25)
+
+plot(rf_perf_imp_z, main = paste("ROC curve Random Forest (z) mtry =", params$mtry_imp), col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+text(0.6,0.25, paste("AUC =", rf_auc_imp_z), cex = 1.25)
+```
+
+
+
+# Mejores modelos
+
+
+Tabla resultado mejores modelos Con AUC >= 0.9.
+
+```{r}
+Modelo <- c("knn", "Naive Bayes", "ANN", "SVM", "Árboles decisión", "Bosques aleatorios")
+
+Normalizacion <- c("z", "-", "z", "z", "z", "z")
+
+Parametro <- c("k = 9", "laplace = 0", "hidden = 5", "kernel = rbfdot", "trials = 10", "mtry = 4")
+
+TP <- c(knn_eval_imp_z[["table"]][4],
+        nbayes_eval[["table"]][4],
+        ann_eval_z[["table"]][4],
+        svm_eval_imp_z[["table"]][4],
+        ad_eval_imp_z[["table"]][4],
+        rf_eval_z[["table"]][4])
+
+TN <- c(knn_eval_imp_z[["table"]][1],
+        nbayes_eval[["table"]][1],
+        ann_eval_z[["table"]][1],
+        svm_eval_imp_z[["table"]][1],
+        ad_eval_imp_z[["table"]][1],
+        rf_eval_z[["table"]][1])
+
+FP <- c(knn_eval_imp_z[["table"]][2],
+        nbayes_eval[["table"]][2],
+        ann_eval_z[["table"]][2],
+        svm_eval_imp_z[["table"]][2],
+        ad_eval_imp_z[["table"]][2],
+        rf_eval_z[["table"]][2])
+
+FN <- c(knn_eval_imp_z[["table"]][3],
+        nbayes_eval[["table"]][3],
+        ann_eval_z[["table"]][3],
+        svm_eval_imp_z[["table"]][3],
+        ad_eval_imp_z[["table"]][3],
+        rf_eval_z[["table"]][3])
+
+Sensibilidad <- c(round(knn_eval_imp_z[["byClass"]][1], 4),
+                  round(nbayes_eval[["byClass"]][1], 4),
+                  round(ann_eval_z[["byClass"]][1], 4),
+                  round(svm_eval_imp_z[["byClass"]][1], 4),
+                  round(ad_eval_imp_z[["byClass"]][1], 4),
+                  round(rf_eval_z[["byClass"]][1], 4))
+
+Especificidad <- c(round(knn_eval_imp_z[["byClass"]][2], 4),
+                   round(nbayes_eval[["byClass"]][2], 4),
+                   round(ann_eval_z[["byClass"]][2], 4),
+                   round(svm_eval_imp_z[["byClass"]][2], 4),
+                   round(ad_eval_imp_z[["byClass"]][2], 4),
+                   round(rf_eval_z[["byClass"]][2], 4))
+
+Accuracy <- c(round(knn_eval_imp_z[["overall"]][1], 4),
+              round(nbayes_eval[["overall"]][1], 4),
+              round(ann_eval_z[["overall"]][1], 4),
+              round(svm_eval_imp_z[["overall"]][1], 4),
+              round(ad_eval_imp_z[["overall"]][1], 4),
+              round(rf_eval_z[["overall"]][1], 4))
+
+Kappa <- c(round(knn_eval_imp_z[["overall"]][2], 4),
+           round(nbayes_eval[["overall"]][2], 4),
+           round(ann_eval_z[["overall"]][2], 4),
+           round(svm_eval_imp_z[["overall"]][2], 4),
+           round(ad_eval_imp_z[["overall"]][2], 4),
+           round(rf_eval_z[["overall"]][2], 4))
+
+AUC <- c(round(knn_auc_imp_z, 4),
+         round(nbayes_auc, 4),
+         round(ann_auc_z, 4),
+         round(svm_auc_imp_z, 4),
+         round(ad_auc_imp_z, 4),
+         round(rf_auc_z, 4))
+
+
+tabla <- data.frame(Modelo, Normalizacion, Parametro, TP, TN, FP, FN, Sensibilidad, Especificidad, Accuracy, Kappa, AUC)
+colnames_tabla <- c("Algoritmo", "Normalización", "Parámetro", "TP", "TN", "FP", "FN", "Sensibilidad", "Especificidad", "Accuracy", "Kappa", "AUC")
+```
+
+```{r message=FALSE}
+knitr::kable(tabla, col.names = colnames_tabla)
+```
+
+
+Exportamos el mejor modelo
+
+```{r}
+save(svm_model_imp_z, file = "model_SVM.RData")
+```
+
+
+
+# Datos del NCI
+
+
+Se lee el archivo csv descargado del NCI y se eliminan moléculas con valores faltantes o repetidas. El dataset resultado se escribe en un csv para ser utilizado en KNIME.
+
+```{r}
+moleculas_NCI <- read.csv("NCI.csv", sep = ";", stringsAsFactors = FALSE, header = FALSE)
+colnames(moleculas_NCI) <- c("id", "smiles")
+
+moleculas_NCI <- moleculas_NCI %>% distinct(smiles, .keep_all = TRUE)
+```
+
+```{r}
+write.csv(moleculas_NCI, "moleculas_filtrado_NCI.csv", row.names = FALSE)
+```
+
+
+
+# Predecir actividad de moléculas del NCI 
+
+
+Tratamos los datos de la misma manera que hicimos con los datos de entrenamiento, escogiendo los mismos descriptores usados y aplicando la misma normalización. 
+
+Finalmente se realiza la predicción de nuevas moléculas activas.
+
+```{r}
+moleculas_descrip_NCI <- read.csv("moleculas_descriptores_NCI.csv", sep = ";", stringsAsFactors = FALSE, na.strings = c("","?"))
+
+
+moleculas_descrip_NCI <- moleculas_descrip_NCI[ ,c(1:16,18,23,25,27,32)]
+
+
+moleculas_descrip_NCI <- na.omit(moleculas_descrip_NCI)
+```
+
+```{r}
+str(moleculas_descrip_NCI)
+```
+
+```{r}
+summary(moleculas_descrip_NCI)
+```
+
+```{r}
+moleculas_NCI_Z <- scale(moleculas_descrip_NCI[ ,3:ncol(moleculas_descrip_NCI)], center = attr(moleculas_ML_z_scale, "scaled:center"), scale = attr(moleculas_ML_z_scale, "scaled:scale"))
+
+
+moleculas_NCI_Z <- cbind(moleculas_descrip_NCI[ ,c(1,2)], moleculas_NCI_Z)
+
+
+moleculas_NCI_Z$Actividad <- predict(svm_model_imp_z, moleculas_NCI_Z[ ,3:21])
+
+summary(moleculas_NCI_Z$Actividad)
+```
+
+```{r}
+moleculas_NCI_activas <- moleculas_NCI_Z[moleculas_NCI_Z$Actividad == "S", ]
+moleculas_NCI_activas <- moleculas_NCI_activas[ ,c(1,2)]
+```
+
+```{r}
+write.csv(moleculas_NCI_activas, "moleculas_NCI_activas.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+

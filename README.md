@@ -39,3 +39,6 @@ El mejor modelo obtenido, guardado en el archivo model_SVM, puede usarse siguien
 
 `resultados <- predict(svm_model_imp_z, datos_normalizados)`
 
+Se obtiene un vector con "S" para las moléculas predichas como que presentan actividad y "N" para las moléculas predichas como que no presentan actividad.
+
+
